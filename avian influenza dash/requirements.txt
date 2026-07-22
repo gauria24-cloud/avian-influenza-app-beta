@@ -1,0 +1,11 @@
+dash
+plotly
+pandas
+numpy
+requests
+gunicorn
+lxml
+beautifulsoup4
+html5lib
+openpyxl
+scikit-learn
