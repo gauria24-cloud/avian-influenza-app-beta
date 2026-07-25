@@ -1,4 +1,5 @@
 from dash import Dash, html, dcc, Input, Output, State, ctx, no_update
+import os
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -6,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 import json
 import math
-import os
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -19,6 +19,8 @@ app = Dash(
     external_stylesheets=external_stylesheets,
     suppress_callback_exceptions=True
 )
+
+# Expose the underlying Flask server for Render/Gunicorn deployment.
 server = app.server
 
 PAGE_WIDTH = "92%"
@@ -43,6 +45,19 @@ CDC_BACKYARD_FLOCK_URL = "https://www.cdc.gov/bird-flu/caring/index.html"
 USDA_AVIAN_INFLUENZA_INFO_URL = "https://www.aphis.usda.gov/livestock-poultry-disease/avian/avian-influenza"
 AIV_WATER_PERSISTENCE_URL = "https://pmc.ncbi.nlm.nih.gov/articles/PMC3993280/"
 AIV_WATER_STABILITY_URL = "https://pubmed.ncbi.nlm.nih.gov/19081209/"
+
+# -----------------------------
+# Beta-testing cache settings
+# -----------------------------
+# BETA_MODE=true makes the dashboard use a saved BOAH CSV first, which prevents
+# beta testers from waiting on a slow live BOAH webpage scrape every time they
+# open the Track Outbreak page. Set BETA_MODE=false on Render later if you want
+# the app to attempt a live pull first.
+BETA_MODE = os.environ.get("BETA_MODE", "true").lower() == "true"
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
+BOAH_CACHE_PATH = DATA_DIR / "boah_cache.csv"
+BOAH_METADATA_PATH = DATA_DIR / "boah_cache_metadata.json"
 
 
 def asset_src(filename, fallback="chicken.png"):
@@ -623,6 +638,88 @@ def fallback_boah_data():
 
 
 def load_boah_data():
+    """
+    Load and clean BOAH HPAI records.
+
+    Beta mode behavior:
+    - If data/boah_cache.csv exists, use it immediately.
+    - This makes the beta-testing dashboard load much faster on Render and avoids
+      making every survey participant wait for pd.read_html() to scrape the BOAH
+      webpage.
+
+    Live/fallback behavior:
+    - If no cache exists, the app attempts the live BOAH webpage once.
+    - After a successful live pull, it saves data/boah_cache.csv and
+      data/boah_cache_metadata.json.
+    - If the live page fails, the app falls back to the saved cache if available.
+    - If neither live data nor cache is available, it uses the built-in fallback
+      dataset so the dashboard still opens for demonstration.
+    """
+
+    DATA_DIR.mkdir(exist_ok=True)
+
+    required_columns = [
+        "Flock",
+        "County",
+        "Date Confirmed",
+        "Birds Affected",
+        "Type of Operation",
+        "Status",
+        "Type",
+        "Control Area",
+        "Surveillance Zone",
+    ]
+
+    def clean_cached_dataframe(cached_df):
+        cached_df = cached_df.copy()
+        for col in required_columns:
+            if col not in cached_df.columns:
+                if col == "Birds Affected":
+                    cached_df[col] = 0
+                else:
+                    cached_df[col] = "Unknown"
+
+        cached_df["Flock"] = cached_df["Flock"].astype(str)
+        cached_df["County"] = cached_df["County"].astype(str).apply(lambda x: extract_county(x) if x else "Unknown")
+        cached_df["Date Confirmed"] = cached_df["Date Confirmed"].astype(str)
+        cached_df["Birds Affected"] = cached_df["Birds Affected"].apply(clean_birds_affected)
+        cached_df["Type of Operation"] = cached_df["Type of Operation"].astype(str)
+        cached_df["Status"] = cached_df["Status"].astype(str)
+        cached_df["Type"] = cached_df["Type"].astype(str)
+        cached_df["Control Area"] = cached_df["Control Area"].astype(str)
+        cached_df["Surveillance Zone"] = cached_df["Surveillance Zone"].astype(str)
+
+        cached_df = cached_df[
+            (cached_df["County"] != "Unknown")
+            & (cached_df["County"].str.lower() != "nan")
+            & (cached_df["Birds Affected"] >= 0)
+        ]
+        return cached_df[required_columns]
+
+    # 1. Fast beta-testing mode: read the saved BOAH snapshot first.
+    if BETA_MODE and BOAH_CACHE_PATH.exists():
+        try:
+            cached = pd.read_csv(BOAH_CACHE_PATH)
+            cleaned_cache = clean_cached_dataframe(cached)
+
+            cached_at = "unknown time"
+            if BOAH_METADATA_PATH.exists():
+                try:
+                    with open(BOAH_METADATA_PATH, "r") as f:
+                        metadata = json.load(f)
+                    cached_at = metadata.get("cached_at", cached_at)
+                except Exception:
+                    pass
+
+            return (
+                cleaned_cache,
+                f"Beta BOAH data snapshot loaded from cache. Cached at: {cached_at}.",
+            )
+        except Exception as error:
+            print("BOAH cache could not be loaded:", error)
+
+    # 2. Live BOAH pull. This is used when cache does not exist, or when
+    # BETA_MODE=false.
     try:
         tables = pd.read_html(BOAH_CASE_URL)
 
@@ -643,7 +740,7 @@ def load_boah_data():
                 break
 
         if selected_table is None:
-            return fallback_boah_data(), "Fallback BOAH sample data shown because the live table could not be parsed."
+            raise ValueError("The BOAH webpage loaded, but a usable county/bird table was not found.")
 
         df = selected_table.copy()
 
@@ -675,14 +772,47 @@ def load_boah_data():
         ]
 
         if cleaned.empty:
-            return fallback_boah_data(), "Fallback BOAH sample data shown because the live table was empty after cleaning."
+            raise ValueError("The BOAH table was empty after cleaning.")
 
+        cleaned = cleaned[required_columns]
+
+        # Save the cleaned data, not the raw webpage table, so beta mode loads
+        # quickly and reliably later.
+        cleaned.to_csv(BOAH_CACHE_PATH, index=False)
+        metadata = {
+            "source": BOAH_CASE_URL,
+            "cached_at": datetime.now().strftime("%b %d, %Y at %I:%M %p"),
+            "mode": "live_pull_saved_to_cache",
+            "record_count": int(len(cleaned)),
+        }
+        with open(BOAH_METADATA_PATH, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        if BETA_MODE:
+            return cleaned, "Live BOAH data loaded and saved to cache for beta testing."
         return cleaned, "Live BOAH data loaded."
 
     except Exception as error:
         print("BOAH data could not be loaded:", error)
-        return fallback_boah_data(), "Fallback BOAH sample data shown because the live BOAH page could not be loaded."
 
+        # 3. If live loading fails, try an existing cache even when BETA_MODE is false.
+        if BOAH_CACHE_PATH.exists():
+            try:
+                cached = pd.read_csv(BOAH_CACHE_PATH)
+                cleaned_cache = clean_cached_dataframe(cached)
+                return (
+                    cleaned_cache,
+                    "Saved BOAH data snapshot loaded because the live BOAH page could not be reached.",
+                )
+            except Exception as cache_error:
+                print("Cached BOAH fallback also failed:", cache_error)
+
+        # 4. Final fallback: keep the dashboard usable for demos instead of
+        # leaving users on a loading screen.
+        return (
+            fallback_boah_data(),
+            "Fallback BOAH sample data shown because neither live BOAH data nor the saved cache could be loaded.",
+        )
 
 def make_boah_summary_card(boah_data):
     total_records = len(boah_data)
@@ -3674,6 +3804,10 @@ def build_dashboard_content():
             for records in monthly_status_summary["Records"].tolist()
         ]
 
+    # Stacked month labels keep the charts readable on smaller screens.
+    # Example: Jan 2026 displays as Jan on one line and 2026 underneath.
+    month_tick_labels = [str(month).replace(" ", "<br>") for month in month_order]
+
     map_data = county_summary.copy()
     map_data["Latitude"] = map_data["County"].map(lambda c: county_coordinates.get(c, (None, None))[0])
     map_data["Longitude"] = map_data["County"].map(lambda c: county_coordinates.get(c, (None, None))[1])
@@ -3748,8 +3882,7 @@ def build_dashboard_content():
         status for status in monthly_status_summary["Status"].astype(str).unique().tolist()
         if status not in ["Depopulated", "Restocking Approved"]
     ]
-    # Stacked month labels so Jan 2026 does not overlap with Feb 2026
-    month_tick_labels = [str(month).replace(" ", "<br>") for month in month_order]
+
     fig_status = px.bar(
         monthly_status_summary,
         x="Month",
@@ -3773,23 +3906,34 @@ def build_dashboard_content():
     fig_status.update_layout(
         paper_bgcolor=CARD_BG,
         plot_bgcolor=CARD_BG,
-        font=dict(color=TEXT_DARK, family="Inter"),
+        font=dict(color=TEXT_DARK, family="Inter", size=14),
         title_font=dict(size=22, color=DARK_RED),
         xaxis_title="Month",
         yaxis_title="Flock / Premises Records in Month",
-        yaxis=dict(range=[0, status_y_max], gridcolor="#f1ead2", zerolinecolor="#d7bd62"),
+        yaxis=dict(range=[0, status_y_max], gridcolor="#f1ead2", zerolinecolor="#d7bd62", automargin=True),
         xaxis=dict(
-    categoryorder="array",
-    categoryarray=month_order,
-    tickmode="array",
-    tickvals=month_order,
-    ticktext=month_tick_labels,
-    tickangle=0,
-    tickfont=dict(size=13),
-    automargin=True,
-),
-margin=dict(l=70, r=40, t=110, b=120),
-        uniformtext_minsize=11,
+            categoryorder="array",
+            categoryarray=month_order,
+            tickmode="array",
+            tickvals=month_order,
+            ticktext=month_tick_labels,
+            tickangle=0,
+            tickfont=dict(size=13),
+            automargin=True,
+        ),
+        legend_title_text="Response Status",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            font=dict(size=13),
+        ),
+        bargap=0.28,
+        bargroupgap=0.08,
+        margin=dict(l=62, r=30, t=105, b=104),
+        uniformtext_minsize=10,
         uniformtext_mode="hide",
     )
 
@@ -3811,12 +3955,22 @@ margin=dict(l=70, r=40, t=110, b=120),
     fig_trend.update_layout(
         paper_bgcolor=CARD_BG,
         plot_bgcolor=CARD_BG,
-        font=dict(color=TEXT_DARK, family="Inter"),
+        font=dict(color=TEXT_DARK, family="Inter", size=14),
         title_font=dict(size=22, color=DARK_RED),
         xaxis_title="Month",
         yaxis_title="Confirmed Flock / Premises Records",
-        xaxis=dict(categoryorder="array", categoryarray=month_order),
-        margin=dict(l=40, r=30, t=60, b=50),
+        xaxis=dict(
+            categoryorder="array",
+            categoryarray=month_order,
+            tickmode="array",
+            tickvals=month_order,
+            ticktext=month_tick_labels,
+            tickangle=0,
+            tickfont=dict(size=13),
+            automargin=True,
+        ),
+        yaxis=dict(gridcolor="#f1ead2", zerolinecolor="#d7bd62", automargin=True),
+        margin=dict(l=56, r=30, t=70, b=96),
     )
 
     if map_data.empty:
